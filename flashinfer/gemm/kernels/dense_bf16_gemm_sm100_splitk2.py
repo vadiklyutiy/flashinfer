@@ -45,6 +45,11 @@ _COPY_ELEMS = 8
 _SUPPORTED_WARPS_M = (1, 2, 4)
 _SUPPORTED_WARPS_K = (1, 2, 4, 8)
 _SUPPORTED_TILE_KS = (64, 128, 256)
+# Tokens one CTA covers, in units of the MMA N of 8.  16 makes a B fragment
+# fill exactly one ldmatrix.x4; 8 halves the wasted MMA columns when the batch
+# is narrower than that, and 32 serves 17..32 tokens in one pass instead of
+# two.
+_SUPPORTED_TILE_NS = (8, 16, 32)
 _MAX_SMEM_BYTES = 200 * 1024
 _MAX_M = 64
 # Autotuning explores a strict subset of the 26 valid (warps_m, warps_k,
@@ -81,8 +86,16 @@ _AUTOTUNE_FAMILIES = (
 # 164 KB.  Clamping does most of the work -- these three rungs land on eleven
 # distinct depths across the shapes, and adding the rungs 1, 8 and 12 back
 # nearly doubles the tactic count while leaving the worst case where it is.
-_AUTOTUNE_DEPTHS = (4, 6, 10)
+_AUTOTUNE_DEPTHS = (4, 8, 12)
 _MAX_STAGES = 8
+# SMs on a B200, which is what the token-tile ranking is calibrated against.
+_SM_COUNT = 148
+# Token tiles measured per token count, taken off ``_tile_n_ranking``.  Two is
+# the useful number: the ranking's first choice is already optimal in 102 of
+# 112 measured cases, and its second covers six of the ten misses, including
+# the largest at 8.6%.  A third would add half again as many tactics to fix two
+# cases worth 1.3% and 4.0% on the launch-bound K=128 shapes.
+_AUTOTUNE_TILE_NS = 2
 # Below this many K tiles a pipeline cannot be filled, so a narrower K tile
 # that yields more of them wins.  Every measured tile_k winner follows it.
 _MIN_PIPELINED_K_TILES = 6
@@ -97,15 +110,18 @@ _SMEM_TWO_CTAS_BYTES = 112 * 1024
 class SplitK2Tactic:
     """One split-k-2 specialization.
 
-    Every field is a function of ``(N, K)`` only.  Keeping the tactic
-    M-independent means a cached choice stays valid as the token count moves
-    between autotuner buckets.
+    Every field except ``tile_n`` is a function of ``(N, K)`` only, so a cached
+    choice stays valid as the token count moves inside an autotuner bucket.
+    ``tile_n`` is how many tokens one CTA covers, so it does depend on M -- but
+    only through ``ceil(M / tile_n)``, and FlashInfer buckets M by powers of
+    two, which keeps a bucket's tactic valid across the whole bucket.
     """
 
     mma_warps_m: int
     mma_warps_k: int
     tile_k: int
     stages: int
+    tile_n: int = TILE_N
 
 
 def _align_1k(nbytes: int) -> int:
@@ -131,7 +147,7 @@ def _g2s_thread_shape(tile_rows: int, tile_k: int, num_threads: int) -> tuple[in
 def _smem_bytes(tactic: SplitK2Tactic, stages: int) -> int:
     tile_m = MMA_INST_MNK[0] * tactic.mma_warps_m
     num_warps = tactic.mma_warps_m * tactic.mma_warps_k
-    acc_elems = MMA_INST_MNK[0] * TILE_N // WARP_SIZE
+    acc_elems = MMA_INST_MNK[0] * tactic.tile_n // WARP_SIZE
     reduce_bytes = (
         num_warps * WARP_SIZE * acc_elems * 4 if tactic.mma_warps_k > 1 else 0
     )
@@ -140,10 +156,19 @@ def _smem_bytes(tactic: SplitK2Tactic, stages: int) -> int:
         _align_1k(nbytes)
         for nbytes in (
             tile_m * tactic.tile_k * 2 * stages,
-            TILE_N * tactic.tile_k * 2 * stages,
+            tactic.tile_n * tactic.tile_k * 2 * stages,
             reduce_bytes,
         )
     )
+
+
+def _ldmatrix_count(rows: int) -> int:
+    """8x8 matrices one ``ldmatrix`` should move for a ``rows`` x 16 tile.
+
+    The instruction moves at most four, so a wider tile is covered by issuing
+    the atom more than once.
+    """
+    return min(4, rows * MMA_INST_MNK[2] // 64)
 
 
 def effective_stages(tactic: SplitK2Tactic, k: int) -> int:
@@ -159,6 +184,8 @@ def validate_tactic(tactic: SplitK2Tactic, m: int, n: int, k: int) -> None:
         raise ValueError(f"unsupported mma_warps_k={tactic.mma_warps_k}")
     if tactic.tile_k not in _SUPPORTED_TILE_KS:
         raise ValueError(f"unsupported tile_k={tactic.tile_k}")
+    if tactic.tile_n not in _SUPPORTED_TILE_NS:
+        raise ValueError(f"unsupported tile_n={tactic.tile_n}")
     if tactic.stages < 1:
         raise ValueError(f"stages={tactic.stages} must be positive")
     if not 1 <= m <= _MAX_M:
@@ -178,10 +205,32 @@ def validate_tactic(tactic: SplitK2Tactic, m: int, n: int, k: int) -> None:
     if num_threads > 1024:
         raise ValueError(f"{num_threads} threads exceeds the CTA limit")
     _g2s_thread_shape(tile_m, tactic.tile_k, num_threads)
-    _g2s_thread_shape(TILE_N, tactic.tile_k, num_threads)
+    _g2s_thread_shape(tactic.tile_n, tactic.tile_k, num_threads)
     smem = _smem_bytes(tactic, effective_stages(tactic, k))
     if smem > _MAX_SMEM_BYTES:
         raise ValueError(f"{smem} bytes of SMEM exceeds {_MAX_SMEM_BYTES}")
+
+
+def _tile_n_ranking(n: int, m: int) -> list[int]:
+    """Token tiles, most promising first, ranked by how the grid fills the GPU.
+
+    A wider token tile serves the batch in fewer passes, but the passes are not
+    serial -- they are more CTAs in the same grid, and on a GPU that is not
+    full they overlap.  So what matters is how many waves the *whole* grid
+    takes, not how many passes there are, and only when two tiles tie on waves
+    does the extra parallelism of the narrower one decide.  Ranking on that
+    picks the measured best in 102 of 112 cases; ranking on passes alone, or
+    breaking ties toward the wider tile, picks it in 27.
+
+    ``tile_m`` is taken as one warp's 16 rows, the value ``mma_warps_m=1``
+    families use, since those win almost everywhere.
+    """
+
+    def waves(tile_n: int) -> tuple[int, int, int]:
+        ctas = (n // MMA_INST_MNK[0]) * -(-m // tile_n)
+        return (-(-ctas // _SM_COUNT), -ctas, tile_n)
+
+    return sorted(_SUPPORTED_TILE_NS, key=waves)
 
 
 def _max_stages(
@@ -224,8 +273,14 @@ def autotune_tactics(m: int, n: int, k: int) -> list[SplitK2Tactic]:
 
     Each measured-useful family is offered at every depth in
     ``_AUTOTUNE_DEPTHS``, clamped to the deepest pipeline the family can hold
-    on this K.  Clamping is what lets one fixed ladder serve every shape: at
-    K=128 there is a single K tile, so every rung collapses onto depth 1.
+    on this K and token tile.  Clamping is what lets one fixed ladder serve
+    every shape: at K=128 there is a single K tile, so every rung collapses
+    onto depth 1.
+
+    Token tiles are not enumerated.  ``_tile_n_ranking`` orders them well
+    enough that the top two carry the choice, which keeps the space near where
+    it was before ``tile_n`` existed while recovering most of what pinning it
+    at 16 gave up: 1.2% at the 90th percentile against 9.3%.
     """
     tactics: list[SplitK2Tactic] = []
     try:
@@ -233,18 +288,21 @@ def autotune_tactics(m: int, n: int, k: int) -> list[SplitK2Tactic]:
     except ValueError:
         return []
     deepest_rung = max(_AUTOTUNE_DEPTHS)
-    for warps_m, warps_k, tile_k in _AUTOTUNE_FAMILIES:
-        if k % tile_k:
-            continue
-        probe = SplitK2Tactic(warps_m, warps_k, tile_k, 1)
-        deepest = _max_stages(probe, k, _MAX_SMEM_BYTES, cap=deepest_rung)
-        for rung in _AUTOTUNE_DEPTHS:
-            tactic = SplitK2Tactic(warps_m, warps_k, tile_k, min(rung, deepest))
-            try:
-                validate_tactic(tactic, m, n, k)
-            except ValueError:
+    for tile_n in _tile_n_ranking(n, m)[:_AUTOTUNE_TILE_NS]:
+        for warps_m, warps_k, tile_k in _AUTOTUNE_FAMILIES:
+            if k % tile_k:
                 continue
-            tactics.append(tactic)
+            probe = SplitK2Tactic(warps_m, warps_k, tile_k, 1, tile_n)
+            deepest = _max_stages(probe, k, _MAX_SMEM_BYTES, cap=deepest_rung)
+            for rung in _AUTOTUNE_DEPTHS:
+                tactic = SplitK2Tactic(
+                    warps_m, warps_k, tile_k, min(rung, deepest), tile_n
+                )
+                try:
+                    validate_tactic(tactic, m, n, k)
+                except ValueError:
+                    continue
+                tactics.append(tactic)
     return list(dict.fromkeys(tactics))
 
 
@@ -292,7 +350,7 @@ class SplitK2DenseGemmKernel:
         self.mma_warps_m = tactic.mma_warps_m
         self.mma_warps_k = tactic.mma_warps_k
         self.tile_m = MMA_INST_MNK[0] * tactic.mma_warps_m
-        self.tile_n = TILE_N
+        self.tile_n = tactic.tile_n
         self.tile_k = tactic.tile_k
         self.use_pdl = use_pdl
 
@@ -301,14 +359,14 @@ class SplitK2DenseGemmKernel:
         self.k_iters = k_extent // tactic.tile_k
         self.k_blocks_per_warp = tactic.tile_k // tactic.mma_warps_k // MMA_INST_MNK[2]
         self.stages = effective_stages(tactic, k_extent)
-        self.acc_elems = MMA_INST_MNK[0] * TILE_N // WARP_SIZE
+        self.acc_elems = MMA_INST_MNK[0] * self.tile_n // WARP_SIZE
         self.smem_bytes = _smem_bytes(tactic, self.stages)
 
     def _make_tiled_mma(self):
         return cute.make_tiled_mma(
             warp.MmaF16BF16Op(self.element_type, cutlass.Float32, MMA_INST_MNK),
             cute.make_layout((1, 1, 1)),
-            permutation_mnk=(MMA_INST_MNK[0], TILE_N, MMA_INST_MNK[2]),
+            permutation_mnk=(MMA_INST_MNK[0], self.tile_n, MMA_INST_MNK[2]),
         )
 
     @cute.jit
@@ -417,7 +475,9 @@ class SplitK2DenseGemmKernel:
 
         thr_mma = tiled_mma.get_slice(lane_idx)
         acc = cute.make_rmem_tensor(
-            cute.make_layout(tiled_mma.partition_shape_C((MMA_INST_MNK[0], TILE_N))),
+            cute.make_layout(
+                tiled_mma.partition_shape_C((MMA_INST_MNK[0], self.tile_n))
+            ),
             cutlass.Float32,
         )
         acc.fill(0.0)
@@ -427,16 +487,21 @@ class SplitK2DenseGemmKernel:
         frag_a = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
         frag_b = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
 
-        ldm_atom = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(False, 4), self.element_type
-        )
         s2r_a = cute.make_tiled_copy(
-            ldm_atom,
+            cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(False, _ldmatrix_count(self.tile_m)),
+                self.element_type,
+            ),
             layout_tv=tiled_mma.tv_layout_A_tiled,
             tiler_mn=(tiled_mma.get_tile_size(0), tiled_mma.get_tile_size(2)),
         )
+        # A narrow token tile holds fewer than four 8x8 matrices, so it needs a
+        # narrower ldmatrix than the A side does.
         s2r_b = cute.make_tiled_copy(
-            ldm_atom,
+            cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(False, _ldmatrix_count(self.tile_n)),
+                self.element_type,
+            ),
             layout_tv=tiled_mma.tv_layout_B_tiled,
             tiler_mn=(tiled_mma.get_tile_size(1), tiled_mma.get_tile_size(2)),
         )
@@ -513,12 +578,12 @@ class SplitK2DenseGemmKernel:
         if warp_k == 0:
             row_tile = bidx * self.mma_warps_m + warp_m
             tCgC = thr_mma.partition_C(
-                cute.local_tile(gC, (MMA_INST_MNK[0], TILE_N), (row_tile, bidy))
+                cute.local_tile(gC, (MMA_INST_MNK[0], self.tile_n), (row_tile, bidy))
             )
             tCcC = thr_mma.partition_C(
                 cute.local_tile(
                     cute.make_identity_tensor(gC.shape),
-                    (MMA_INST_MNK[0], TILE_N),
+                    (MMA_INST_MNK[0], self.tile_n),
                     (row_tile, bidy),
                 )
             )
