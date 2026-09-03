@@ -1726,6 +1726,71 @@ def _cute_dsl_direct_bf16_gemm_runner(
     return CuteDSLDirectBf16Runner()
 
 
+@functools.cache
+def _cute_dsl_splitk2_bf16_gemm_runner(
+    compute_capability: int,
+):
+    from .kernels.dense_bf16_gemm_sm100_splitk2 import (
+        SplitK2Tactic,
+        autotune_tactics,
+        default_tactic,
+        run_splitk2_dense,
+    )
+
+    class CuteDSLSplitK2Bf16Runner(TunableRunner):
+        """Warp-MMA GEMM that splits K inside the CTA.
+
+        Every tactic field depends only on ``(N, K)``, so a tactic cached under
+        one token bucket stays valid in another and no ``is_tactic_compatible``
+        override is needed.
+        """
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, _, _, pdl, out, *_ = inputs
+            return (
+                str(a.dtype),
+                str(out.dtype),
+                bool(pdl),
+                compute_capability,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list[tuple[int, int, int, int]]:
+            a, b, bias, *_ = inputs
+            if bias is not None:
+                return []
+            m, k = a.shape
+            n = b.shape[1]
+            return [astuple(config) for config in autotune_tactics(m, n, k)]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, *_ = inputs
+            if bias is not None:
+                raise ValueError("CuTeDSL split-k-2 GEMM does not support bias.")
+            if tactic == -1:
+                tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
+            else:
+                try:
+                    tactic = SplitK2Tactic(*tactic)
+                except TypeError as error:
+                    raise ValueError(
+                        "CuTeDSL split-k-2 tactics must be "
+                        "(mma_warps_m, mma_warps_k, tile_k, stages)."
+                    ) from error
+            return run_splitk2_dense(a, b, out, bool(pdl), tactic)
+
+    return CuteDSLSplitK2Bf16Runner()
+
+
 def bf16_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1780,6 +1845,11 @@ def bf16_gemm_sm100(
                 (direct_runner, splitk_runner)
                 if prefer_direct
                 else (splitk_runner, direct_runner)
+            )
+            # Appended last so the no-valid-tactic fallback below still lands
+            # on a runner that serves every shape.
+            runners.append(
+                _cute_dsl_splitk2_bf16_gemm_runner(compute_capability_number)
             )
         else:
             runners.append(splitk_runner)
