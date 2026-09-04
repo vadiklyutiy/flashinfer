@@ -1919,9 +1919,13 @@ def _cute_dsl_splitk2_bf16_gemm_runner(
     class CuteDSLSplitK2Bf16Runner(TunableRunner):
         """Warp-MMA GEMM that splits K inside the CTA.
 
-        Every tactic field depends only on ``(N, K)``, so a tactic cached under
-        one token bucket stays valid in another and no ``is_tactic_compatible``
-        override is needed.
+        Every tactic field is correct for any token count, so no
+        ``is_tactic_compatible`` override is needed.  One of them, ``tile_n``,
+        is nonetheless chosen *for* a token count: it is how many tokens one
+        CTA covers, so a tactic cached under one bucket stays valid in another
+        but may no longer be the fastest there.  Buckets are powers of two and
+        ``tile_n`` candidates are ranked per bucket, so the mismatch is bounded
+        to whatever a bucket's own range spans.
         """
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -1937,7 +1941,7 @@ def _cute_dsl_splitk2_bf16_gemm_runner(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
-        ) -> list[tuple[int, int, int, int]]:
+        ) -> list[tuple[int, int, int, int, int]]:
             a, b, bias, *_ = inputs
             if bias is not None:
                 return []
@@ -1963,7 +1967,7 @@ def _cute_dsl_splitk2_bf16_gemm_runner(
                 except TypeError as error:
                     raise ValueError(
                         "CuTeDSL split-k-2 tactics must be "
-                        "(mma_warps_m, mma_warps_k, tile_k, stages)."
+                        "(mma_warps_m, mma_warps_k, tile_k, stages, tile_n)."
                     ) from error
             return run_splitk2_dense(a, b, out, bool(pdl), tactic)
 

@@ -79,15 +79,16 @@ _AUTOTUNE_FAMILIES = (
     (2, 2, 128),
     (4, 1, 256),
 )
-# Pipeline depths offered per family, each clamped to the deepest that fits.
-# Winners spread over 1..12 stages, so no single depth and no occupancy-derived
-# pair covers them: past 114 KB every tactic is down to one resident CTA, yet
-# inside that regime depth still decides, and N=2112,K=7168 wants ten stages at
-# 164 KB.  Clamping does most of the work -- these three rungs land on eleven
-# distinct depths across the shapes, and adding the rungs 1, 8 and 12 back
-# nearly doubles the tactic count while leaving the worst case where it is.
+# Pipeline depths offered per family and token tile, each clamped to the
+# deepest that fits.  Winners spread over 1..12 stages, so no single depth and
+# no occupancy-derived pair covers them: past 114 KB every tactic is down to
+# one resident CTA, yet inside that regime depth still decides, and
+# N=2112,K=7168 wants ten stages at 164 KB.  Clamping does most of the work --
+# these three rungs land on eight distinct depths across the shapes.  Offering
+# every depth instead more than doubles the tactic count and does not move the
+# worst case; the top rung is 12 rather than 10 because a narrow token tile
+# halves the B buffer and lets a deeper pipeline fit.
 _AUTOTUNE_DEPTHS = (4, 8, 12)
-_MAX_STAGES = 8
 # SMs on a B200, which is what the token-tile ranking is calibrated against.
 _SM_COUNT = 148
 # Token tiles measured per token count, taken off ``_tile_n_ranking``.  Two is
@@ -233,9 +234,7 @@ def _tile_n_ranking(n: int, m: int) -> list[int]:
     return sorted(_SUPPORTED_TILE_NS, key=waves)
 
 
-def _max_stages(
-    tactic: SplitK2Tactic, k: int, budget: int, cap: int = _MAX_STAGES
-) -> int:
+def _max_stages(tactic: SplitK2Tactic, k: int, budget: int, cap: int) -> int:
     """Deepest pipeline that fits the K-tile count, ``budget`` bytes and ``cap``."""
     depth = min(cap, k // tactic.tile_k)
     while depth > 1 and _smem_bytes(tactic, depth) > budget:
@@ -246,20 +245,34 @@ def _max_stages(
 def default_tactic(m: int, n: int, k: int) -> SplitK2Tactic:
     """Pick a tactic without measuring.
 
-    Takes the widest K tile that still leaves enough K tiles to fill a
-    pipeline, splits it four ways across warps when the tile is wide enough to
-    keep a whole ``ldmatrix.x4`` per warp, and stages as deeply as it can
-    without dropping the SM to a single resident CTA.
+    Takes the token tile the ranking prefers, then the widest K tile that still
+    leaves enough K tiles to fill a pipeline, splits it four ways across warps
+    when the tile is wide enough to keep a whole ``ldmatrix.x4`` per warp, and
+    stages as deeply as it can without dropping the SM to a single resident
+    CTA.
+
+    Against the best measured tactic this gives up 1.3% at the median, 8.4% at
+    the 90th percentile and 28% at worst.  That is a poor showing next to what
+    the autotuner reaches, and it is the path taken when tuning is off or the
+    cache misses, so it is worth improving -- but the levers are not where they
+    look.  Searching every combination of family order and depth rule over the
+    78,568-measurement sweep leaves the rule below on top: taking the deepest
+    pipeline that keeps two CTAs resident beats aiming for any fixed depth and
+    beats filling shared memory, and ordering families by measured win count
+    instead of by K tile changes nothing outside noise.  The remaining loss is
+    in choosing one depth at all; the autotuner only does better because it
+    measures three.
     """
     divisors = [tile_k for tile_k in _SUPPORTED_TILE_KS if k % tile_k == 0]
     if not divisors:
         raise ValueError(f"K={k} is not a multiple of any supported tile_k")
+    tile_n = _tile_n_ranking(n, m)[0]
     pipelined = [tile_k for tile_k in divisors if k // tile_k >= _MIN_PIPELINED_K_TILES]
     for tile_k in sorted(pipelined or divisors, reverse=True):
         warps_k = 4 if tile_k >= 128 else 1
-        probe = SplitK2Tactic(1, warps_k, tile_k, 1)
-        stages = _max_stages(probe, k, _SMEM_TWO_CTAS_BYTES)
-        tactic = SplitK2Tactic(1, warps_k, tile_k, stages)
+        probe = SplitK2Tactic(1, warps_k, tile_k, 1, tile_n)
+        stages = _max_stages(probe, k, _SMEM_TWO_CTAS_BYTES, cap=max(_AUTOTUNE_DEPTHS))
+        tactic = SplitK2Tactic(1, warps_k, tile_k, stages, tile_n)
         try:
             validate_tactic(tactic, m, n, k)
         except ValueError:
