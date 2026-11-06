@@ -1096,6 +1096,7 @@ def _run_mega_torch_oracle(
     activation: str = "swiglu",
     per_token_scale: bool = False,
     num_tokens: int = 64,
+    knobs: dict | None = None,
 ):
     """Real-EP kernel launch vs a pure-torch oracle on the GLOBAL expert set.
 
@@ -1224,6 +1225,7 @@ def _run_mega_torch_oracle(
             fc2_alpha=problem["fc2_alpha"],
             fc1_norm_const=problem["fc1_norm_const"],
             enable_fc1_activation_per_token_scale=per_token_scale,
+            knobs=knobs,
         )
         try:
             stage_mega_moe_inputs(
@@ -1430,6 +1432,63 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle_per_token_scale(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega kernel (per-token fc1 "
         f"activation scale, ikr={in_kernel_fc2_reduce}, combine={combine_dtype}) "
         "matches the multi-rank torch oracle"
+    )
+
+
+_RANK_DEDUP_KNOBS = {
+    "mma_tiler_mnk": (256, 128, 256),
+    "cluster_shape_mnk": (2, 1, 1),
+    "use_2cta_instrs": True,
+    "group_hint": 512,
+    "flag_batch": 8,
+    "epi_flag_batch": (2, 4),
+    "load_balance_mode": "atomic_counter",
+}
+
+_DEDUP_DISPATCH = {"rank_dedup_dispatch": True}
+_JOIN_WARPS = {"token_back_join_warps": True}
+_DEDUP_ALL = {**_DEDUP_DISPATCH, **_JOIN_WARPS, "rank_dedup_combine": True}
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "token_back_mode,in_kernel_fc2_reduce,variant",
+    [
+        ("standalone_warps", False, _DEDUP_DISPATCH),
+        ("standalone_warps", False, _JOIN_WARPS),
+        ("standalone_warps", False, {**_DEDUP_DISPATCH, "rank_dedup_combine": True}),
+        ("standalone_warps", False, _DEDUP_ALL),
+        ("reuse_dispatch_warps", False, _DEDUP_ALL),
+        ("epi_warps", False, _DEDUP_DISPATCH),
+        ("standalone_warps", True, _DEDUP_ALL),
+    ],
+    ids=["d", "j", "dc", "djc", "reuse-djc", "epi-d", "ikr-djc"],
+)
+@pytest.mark.parametrize("num_tokens", [64, 1024])
+def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle_rank_dedup(
+    token_back_mode, in_kernel_fc2_reduce, variant, num_tokens
+):
+    """Rank dedup and the token-back helper warps keep the global math: one
+    NVLink pull per (token, rank) fills all of a token's local pool rows, and
+    the combine pre-sum pushes one row per (token, rank) that TopkReduce (or
+    the in-kernel REDG) reduces over ranks."""
+    _require_cuda()
+    pytest.importorskip("triton")
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    _run_mega_torch_oracle(
+        rank,
+        world_size,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        num_tokens=num_tokens,
+        knobs={
+            **_RANK_DEDUP_KNOBS,
+            **variant,
+            "token_back_mode": token_back_mode,
+            "in_kernel_fc2_reduce": in_kernel_fc2_reduce,
+        },
     )
 
 
@@ -1892,6 +1951,33 @@ def test_nvfp4_mega_uneven_sources_and_empty_refill(
             if tile_n == 32 and token_back_mode == "reuse_dispatch_warps"
             else None
         ),
+    )
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "token_back_mode", ["standalone_warps", "reuse_dispatch_warps", "epi_warps"]
+)
+def test_nvfp4_mega_rank_dedup_uneven_sources_and_empty_refill(token_back_mode):
+    """Rank-dedup route records are rewritten every launch: a workspace reused
+    across skewed, empty-source and refilled batches must not see stale ones."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size != 2:
+        pytest.skip("requires two ranks")
+    _run_nvfp4_routing_rounds(
+        rank,
+        world_size,
+        mode="w4a4",
+        hidden=256,
+        intermediate=256,
+        knobs={
+            "token_back_mode": token_back_mode,
+            "load_balance_mode": "atomic_counter",
+            **(_DEDUP_DISPATCH if token_back_mode == "epi_warps" else _DEDUP_ALL),
+        },
+        changing_batches=True,
     )
 
 

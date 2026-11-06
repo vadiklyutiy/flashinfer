@@ -206,6 +206,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
         topk_reduce_persistent: bool = False,
+        rank_dedup_dispatch: bool = False,
+        rank_dedup_combine: bool = False,
+        token_back_join_warps: bool = False,
     ) -> None:
         # The combine wire format drives the fc2 epilogue encoder, token_comm
         # push, and the combine_quant/combine_sf workspace sizing. The dataflow
@@ -409,6 +412,38 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             self.load_balance_mode if self.token_back_enabled else "static"
         )
 
+        # Rank dedup moves each token across NVLink once per (token, rank).
+        # Dispatch dedup applies to every token-back mode; the combine pre-sum
+        # needs the staged bf16 fc2 rows of the dispatch token-back paths and
+        # the reducer that knows which top-k slots carry the per-rank sums.
+        self.rank_dedup_dispatch = bool(rank_dedup_dispatch)
+        self.rank_dedup_combine = bool(rank_dedup_combine)
+        self.token_back_join_warps = bool(token_back_join_warps)
+        if self.rank_dedup_combine and skip_topk_reduce:
+            raise ValueError("rank_dedup_combine requires skip_topk_reduce=False.")
+        if self.token_back_join_warps and not (
+            self.token_back_by_dispatch
+            and self.token_back_schedule_mode == "atomic_counter"
+        ):
+            raise ValueError(
+                "token_back_join_warps requires a dispatch-warp token_back_mode and "
+                "load_balance_mode='atomic_counter'."
+            )
+        if self.rank_dedup_combine and self.token_back_standalone:
+            # The pre-sum keeps several routes' loads in flight. The epilogue
+            # warpgroup's 256 leaves (512 - 256 - 2 * task_reg_cnt) for it.
+            self.token_back_reg_cnt = 512 - self.epi_reg_cnt - 2 * self.task_reg_cnt
+        if self.rank_dedup_dispatch:
+            # Route words pack 24-bit slots / pool rows and a 30-bit token word.
+            if (
+                self.pool_token_capacity >= 1 << 24
+                or self.max_tokens_per_rank * self.num_topk >= 1 << 30
+            ):
+                raise ValueError(
+                    "rank_dedup_dispatch supports pools below 2**24 rows and "
+                    "max_tokens_per_rank * num_topk below 2**30."
+                )
+
         self.token_comm = TokenInPullTokenBackPush(
             world_size=self.world_size,
             num_topk=self.num_topk,
@@ -433,7 +468,11 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             flag_batch=flag_batch,
             is_swap_ab=True,
             token_back_schedule_mode=self.token_back_schedule_mode,
+            rank_dedup_dispatch=self.rank_dedup_dispatch,
+            rank_dedup_combine=self.rank_dedup_combine,
+            token_back_join_warps=self.token_back_join_warps,
         )
+        self.epilogue_joins_token_back = self.token_comm.epilogue_warps_join_token_back
 
         self.topk_reduce_persistent = bool(
             topk_reduce_persistent
@@ -497,6 +536,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                     _DispatchWarpCount * self.token_comm.tb_chunk_bytes, 128
                 )
             )
+        total += _round_up(self.token_comm.dedup_table_slots() * 4, 16)
+        if self.token_comm.epilogue_warps_join_token_back:
+            total += _round_up(self.token_comm.num_epilogue_warps * 8, 16)
         return total
 
     def _smem_misc_budget_bytes(self) -> int:
@@ -733,6 +775,17 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                     16,
                 )
             )
+        if self.rank_dedup_combine:
+            # Combine record of each (token, rank) group, written by the dispatch
+            # leader into the combine leader's pool row.
+            specs.append(
+                _RegionSpec(
+                    "route_rows",
+                    cutlass.Int32,
+                    (pool_token_capacity, TokenInPullTokenBackPush._DedupRecordWords),
+                    16,
+                )
+            )
         if self.token_back_by_dispatch:
             # Local fc2 DATA staging (token_back_by_dispatch modes only); the
             # wire-format dtype sizes the plane.
@@ -817,6 +870,23 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 16,
             ),
         ]
+        if self.rank_dedup_dispatch:
+            # Written each launch by the source ranks for every routed
+            # (token, rank) pair before the dispatch barrier; never reset.
+            specs += [
+                _RegionSpec(
+                    "route_mask",
+                    cutlass.Int32,
+                    (world_size, max_tokens_per_rank),
+                    16,
+                ),
+                _RegionSpec(
+                    "route_slot",
+                    cutlass.Int32,
+                    (world_size, max_tokens_per_rank, num_topk),
+                    16,
+                ),
+            ]
         # separate-kernel-reduce only: the per-topk fc2 combine staging buffer is
         # internalized here instead of being a caller tensor, so the public output
         # is the 2D (T, hidden) reduce result.  It is the cross-rank combine STG
@@ -1027,6 +1097,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
+            f"{'_dedupdispatch' if self.rank_dedup_dispatch else ''}"
+            f"{'_dedupcombine' if self.rank_dedup_combine else ''}"
+            f"{'_tbjoin' if self.token_back_join_warps else ''}"
         )
 
     # -- AOT compile / load (TVM-FFI calling convention) ----------------------
@@ -1479,6 +1552,18 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 self._view_local(local_workspace, "dispatch_route_extent")
                 if cutlass.const_expr(self.max_tokens_per_rank <= 1024) else None
             ),
+            route_mask=(
+                self._view_shared(shared_workspace, "route_mask")
+                if cutlass.const_expr(self.rank_dedup_dispatch) else None
+            ),
+            route_slot=(
+                self._view_shared(shared_workspace, "route_slot")
+                if cutlass.const_expr(self.rank_dedup_dispatch) else None
+            ),
+            route_rows=(
+                self._view_local(local_workspace, "route_rows")
+                if cutlass.const_expr(self.rank_dedup_combine) else None
+            ),
             peer_rank_ptr_mapper=peer_rank_ptr_mapper,
             world_size=self.world_size,
             local_rank=peer_rank_ptr_mapper_host.rank_idx,
@@ -1572,6 +1657,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 num_experts=self.num_total_experts,
                 persistent=self.topk_reduce_persistent,
                 num_sms=self.topk_reduce_num_sms,
+                rank_dedup_experts_per_rank=(
+                    self.num_experts_per_rank if self.rank_dedup_combine else None
+                ),
             )
             if cutlass.const_expr(self.topk_reduce_persistent):
                 reduce(
@@ -1658,6 +1746,24 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             warp_idx=warp_idx,
             lane_idx=lane_idx,
             tidx=tidx,
+        )
+
+    @cute.jit
+    def token_comm_hook_epilogue_token_back(
+        self,
+        token_comm_args,
+        token_comm_storage,
+        epi_smem_ptr,
+        *,
+        warp_idx,
+        lane_idx,
+    ):
+        self.token_comm.epilogue_token_back_body(
+            token_comm_args,
+            token_comm_storage,
+            epi_smem_ptr,
+            warp_idx=warp_idx,
+            lane_idx=lane_idx,
         )
 
     @cute.jit

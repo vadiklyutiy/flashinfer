@@ -240,6 +240,60 @@ def stg_b32_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def ldg_cg_v4_b32_raw(addr: Int64, *, loc=None, ip=None):
+    """``ld.global.cg.v4.u32`` (L2 only) via raw int64 byte address."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [addr.ir_value()],
+        "ld.global.cg.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def sts_v4_b32(smem_ptr, w0: Int32, w1: Int32, w2: Int32, w3: Int32, *, loc=None, ip=None) -> None:
+    """``st.shared.v4.b32`` of four words at a shared-memory pointer."""
+    llvm.inline_asm(
+        None,
+        [
+            smem_ptr.toint(loc=loc, ip=ip).ir_value(),
+            w0.ir_value(),
+            w1.ir_value(),
+            w2.ir_value(),
+            w3.ir_value(),
+        ],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def add_bf16x2(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
+    """Packed ``add.rn.bf16x2`` of two bf16x2 words."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [a.ir_value(), b.ir_value()],
+            "add.rn.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def stg_b64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -> None:
     """``st.global.u64`` via raw int64 byte address."""
     llvm.inline_asm(

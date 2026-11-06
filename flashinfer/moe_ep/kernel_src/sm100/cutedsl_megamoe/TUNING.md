@@ -812,6 +812,37 @@ Each `run_sweep.sh` invocation writes its own timestamped CSV under
   `MEGA_KNOBS` (explicit knob dict / `auto` online autotune) are
   documented in the bench README.
 
+## Rank dedup and token-back helper warps (NVFP4, 2026-11-06)
+
+Three opt-in knobs (off by default, not in the default autotune sweep; pin them in a `knobs=` dict or the knob cache) move each token across NVLink once per (token, rank) instead of once per (token, expert):
+
+- `rank_dedup_dispatch` (D): one pull per (token, rank). Bitwise identical output.
+- `token_back_join_warps` (J): idle dispatch and epilogue warps take token-back work. Requires a dispatch-warp `token_back_mode` and `load_balance_mode="atomic_counter"`; output unchanged.
+- `rank_dedup_combine` (C): one pre-summed push per (token, rank). Requires D, a dispatch-warp `token_back_mode`, the bf16 wire and no caller finalization. Use it with J: without the helper warps the post-GEMM push tail makes it slower than the baseline.
+
+For prefill-sized batches, `{"token_back_mode": "standalone_warps", "load_balance_mode": "atomic_counter", "rank_dedup_dispatch": true, "token_back_join_warps": true, "rank_dedup_combine": true, ...}`.
+
+- **Routing records.** In `dispatch_prep` each source rank groups a token's routes by destination rank. It tags every route in the top bits of its `src_token_topk_idx` word (dispatch leader, skipped, or single route) and, for groups with several routes, writes the topk mask and per-route `(local_expert << 24) | slot` words to the destination (`route_mask` / `route_slot` in the shared workspace, rewritten every launch, never reset).
+- **Dispatch.** The route with the smallest local expert pulls the token, its scales and all topk weights once, resolves every route's pool row per lane (inverse of the rank interleave), fills all of the token's local pool rows and releases their fc1 tiles. Skipped routes cost one load. Single-route rows release their fc1 tile immediately: under dedup a flag batch would hold them across many skipped rows and stall the GEMM.
+- **Combine** (dispatch-warp token-back modes, bf16 wire, separate reduce or ikr). The dispatch leader writes a route record into the pool row of the route with the largest local expert. That row waits for the token's other local fc2 rows, sums them as packed bf16x2 in topk-slot order and pushes one row into the slot of the token's first topk route to that rank. TopkReduce reads only those slots (at most `world_size` per token). The output is deterministic and differs from the per-expert combine by one or two extra bf16 roundings of the per-rank partials (rel-L2 3.2e-3 at the geometry below, NVFP4 quantization itself is ~20%). `epi_warps` keeps the per-expert combine and dedups only the dispatch; `use_custom_finalize` and the quantized wires keep it too.
+- **Token-back parallelism (J).** A token's sum is ready only after its last local expert's fc2, so pre-summed pushes concentrate after the GEMM. The dispatch warps (standalone mode, after their pulls) and the epilogue warps (after their last tile, staging through the epilogue SMEM) take token-back work from the atomic cursor. With C on the standalone path, the token-back warpgroup gets 112 registers instead of 72.
+- **Limits.** `num_topk < 16`, at most 256 local experts, pools below 2^24 rows. Extra memory: `route_mask` / `route_slot` (`world_size * T * (1 + topk) * 4` B shared), the combine record (`pool_rows * 64` B local) and `3 * experts_per_rank * 4` B of SMEM.
+
+Qwen3.8-Flash-Next geometry (hidden 2560, intermediate 640, 512 experts, top-10), 4x B200 EP4, 16384 tokens per rank, knobs `(256, 128, 256)` / cluster `(2, 1, 1)` / `group_hint=512` / `flag_batch=8` / `epi_flag_batch=(2, 4)` / `atomic_counter` / `standalone_warps`. CUPTI medians with cold L2 over the main kernel and TopkReduce (`bench_gpu_time_with_cupti`, 100-180 iterations, max across ranks), mean of two runs in opposite config order; skewed columns use the tuner's `restage_skewed_routing` (max/mean expert load). Medians in µs, change vs the baseline:
+
+| Knobs | Uniform | Skew 19 | Skew 50 |
+|---|---:|---:|---:|
+| Baseline | 1694 (1714 / 1675) | 2163 | 2643 |
+| D | 1726 (+1.8%) | 2009 (-7.1%) | 2573 (-2.7%) |
+| J | 1614 (-4.7%) | 2140 (-1.1%) | 2599 (-1.7%) |
+| D + J | 1583 (-6.6%) | 1913 (-11.6%) | 2392 (-9.5%) |
+| D + C | 2216 (+30.8%) | 2467 (+14.0%) | 2872 (+8.7%) |
+| D + J + C | 1578 (-6.9%) | 1746 (-19.3%) | 1974 (-25.3%) |
+
+At 256 tokens per rank with the small-batch `epi_warps` profile, D alone takes 154.3 to 141.5 µs (-8.3%) at uniform routing and 156.4 to 142.1 µs (-9.1%) at skew 19.
+
+Computed NVLink bytes received per rank and MoE layer at uniform routing drop from ~177 to ~67 MB on dispatch and from ~629 to ~237 MB on combine. The kernel's communication warps are latency-bound rather than NVLink-bound (the baseline combine averages ~0.4 TB/s), so most of the win comes from fewer serialized round trips per warp and a shorter dispatch tail. Variants that measured slower and were dropped: fp32 accumulation of the pre-sum, software-pipelined or TMA-staged pre-sum loads (both delay the concurrent GEMM by 300-500 µs), paced pre-sum pushes and prefetched token-back cursor claims.
+
 ## Next levers
 
 CUDA-graph capture of the launch thunk (landed — `MoEEpMegaLayer.warmup()`

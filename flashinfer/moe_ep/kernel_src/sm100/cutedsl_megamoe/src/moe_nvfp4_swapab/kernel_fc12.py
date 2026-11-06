@@ -196,6 +196,11 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # ``self.enable_token_comm`` inside the device kernel.
         self.epi_reg_cnt = 256
         self.task_reg_cnt = 72
+        # Standalone token-back warpgroup (MegaMoE subclass); defaults to the
+        # task budget.
+        self.token_back_reg_cnt = self.task_reg_cnt
+        # MegaMoE subclass: epilogue warps run token-back after their GEMM work.
+        self.epilogue_joins_token_back = False
 
         self.smem_capacity = utils.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(
@@ -2314,6 +2319,16 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             cute.arch.fence_acq_rel_sys()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem.retrieve_ptr(self.acc_dtype), self.num_tmem_alloc_cols)
+            if cutlass.const_expr(
+                self.enable_token_comm and self.epilogue_joins_token_back
+            ):
+                self.token_comm_hook_epilogue_token_back(
+                    token_comm_args,
+                    token_comm_storage,
+                    epi_smem_storage.epi_smem.data_ptr(),
+                    warp_idx=warp_idx,
+                    lane_idx=cute.arch.lane_idx(),
+                )
 
 
         # ════════════════════════════════════════════════════════════════════
@@ -2328,7 +2343,16 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # to fc1 -> arrive on dispatch-to-sched NamedBarrier).
         if cutlass.const_expr(self.enable_token_comm):
             if warp_idx >= self.dispatch_warp_id[0]:
-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
+                if cutlass.const_expr(
+                    self.token_back_standalone
+                    and self.token_back_reg_cnt != self.task_reg_cnt
+                ):
+                    if warp_idx < self.token_back_warp_id[0]:
+                        cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
+                    else:
+                        cute.arch.warpgroup_reg_dealloc(self.token_back_reg_cnt)
+                else:
+                    cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
 
                 lane_idx_for_dispatch = cute.arch.lane_idx()
                 if cutlass.const_expr(self.token_back_standalone):

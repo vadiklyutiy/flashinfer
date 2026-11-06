@@ -30,6 +30,8 @@ replace its own device snapshot.
 
 ## Pending local diffs vs upstream
 
+- **Rank dedup (2026-11-06):** opt-in `rank_dedup_dispatch`, `rank_dedup_combine` and `token_back_join_warps` constructor arguments of `Sm100MegaMoEKernel` (see `TUNING.md`). Touches `src/src/token_comm.py` (routing records in `dispatch_prep`, the dispatch leader in `dispatch_pull`, the combine pre-sum and the dispatch/epilogue-warp token-back helpers in `token_back_by_push`, the SMEM struct built from a field dict in the original order), `src/src/ptx_helpers.py` (v4 global/shared moves, `add.rn.bf16x2`), `src/moe_nvfp4_swapab/megamoe_kernel.py` (regions, views, register budget), `src/moe_nvfp4_swapab/kernel_fc12.py` (separate token-back warpgroup register count, epilogue token-back hook) and `src/moe_nvfp4_swapab/topk_reduce.py` (`rank_dedup_experts_per_rank` slot mask). With the arguments off, the routing records, regions and hooks are compiled out and the SMEM layout is unchanged.
+
 - **Sparse decode (FlashInfer PR #6447 / #6565, 2026-10-14):** re-ported onto
   this drop in four device files. `src/src/token_comm.py` gives CTA0 ownership
   of small shared reset prefixes (EP1, prefixes above 16 KiB and NCU keep the

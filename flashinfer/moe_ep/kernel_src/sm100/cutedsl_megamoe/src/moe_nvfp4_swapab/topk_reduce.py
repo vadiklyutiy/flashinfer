@@ -261,10 +261,23 @@ class TopkReduce:
         num_sms: Optional[int] = None,
         max_fetch: int = 8,
         fetch_rounds: int = 4,
+        # Rank-dedup combine: each rank pre-sums a token's local routes into the
+        # slot of the token's first topk route to that rank; only those slots
+        # are read. Requires the masked (topk_indices) BF16 path.
+        rank_dedup_experts_per_rank: Optional[int] = None,
     ) -> None:
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.num_experts = None if num_experts is None else int(num_experts)
+        self.rank_dedup_experts_per_rank = (
+            None if rank_dedup_experts_per_rank is None else int(rank_dedup_experts_per_rank)
+        )
+        if self.rank_dedup_experts_per_rank is not None and (
+            combine_format.is_quantized or self.num_experts is None
+        ):
+            raise ValueError(
+                "rank_dedup_experts_per_rank requires a BF16 combine and num_experts."
+            )
         self.combine_format = combine_format
         # ``sm_arch=None`` means "Blackwell or newer", the greenfield default.
         # SM90 has no packed f32x2 math, so the Hopper MegaMoE kernel passes its
@@ -426,6 +439,8 @@ class TopkReduce:
         if cutlass.const_expr(topk_indices is not None):
             if cutlass.const_expr(self.num_experts is None or self.combine_format.is_quantized):
                 raise ValueError("Masked combine requires BF16 storage and a static expert count.")
+        elif cutlass.const_expr(self.rank_dedup_experts_per_rank is not None):
+            raise ValueError("rank_dedup_experts_per_rank requires topk_indices.")
         threads = self._threads
         if cutlass.const_expr(self.persistent):
             if cutlass.const_expr(counters is None or num_tokens_dev is None):
@@ -697,6 +712,22 @@ class TopkReduce:
                 if cutlass.const_expr(mixed_add):
                     for i in cutlass.range_constexpr(hidden_per_thread):
                         acc[i] = Float32(0.0)
+                if cutlass.const_expr(self.rank_dedup_experts_per_rank is not None):
+                    # Slot k carries rank r's pre-summed partial iff it is the
+                    # token's first valid route to r.
+                    route_rank = []
+                    for k in cutlass.range_constexpr(num_topk):
+                        expert = Int32(topk_indices[token_idx, Int32(k)])
+                        rank_of_route = Int32(-1)
+                        if (expert >= 0) & (expert < self.num_experts):
+                            rank_of_route = expert // Int32(self.rank_dedup_experts_per_rank)
+                        route_rank.append(rank_of_route)
+                    first_route_to_rank = []
+                    for k in cutlass.range_constexpr(num_topk):
+                        is_first = route_rank[k] >= Int32(0)
+                        for j in cutlass.range_constexpr(k):
+                            is_first = is_first & (route_rank[j] != route_rank[k])
+                        first_route_to_rank.append(is_first)
                 # Note on load scheduling: ptxas sinks the last one or two of the
                 # num_topk loads below the first adds (4 of 6 in flight,
                 # a second exposed DRAM round trip worth ~44% of stall samples at
@@ -706,8 +737,11 @@ class TopkReduce:
                 for k in cutlass.range_constexpr(0, num_topk, 1):
                     term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
                     if cutlass.const_expr(topk_indices is not None):
-                        expert = topk_indices[token_idx, Int32(k)]
-                        valid_route = (expert >= 0) & (expert < self.num_experts)
+                        if cutlass.const_expr(self.rank_dedup_experts_per_rank is not None):
+                            valid_route = first_route_to_rank[k]
+                        else:
+                            expert = topk_indices[token_idx, Int32(k)]
+                            valid_route = (expert >= 0) & (expert < self.num_experts)
                         term.fill(0)
                         if valid_route:
                             cute.copy(

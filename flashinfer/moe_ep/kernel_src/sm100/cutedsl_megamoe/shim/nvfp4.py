@@ -131,6 +131,15 @@ class MegaMoENvfp4Config:
     # gated activation (``real = fc1_alpha * scale_t * acc``).  Lets the caller
     # quantize ``x_t / scale_t`` to NVFP4 without losing the per-token range.
     enable_fc1_activation_per_token_scale: bool = False
+    # Dispatch pulls a token across NVLink once per (token, rank) and fills
+    # all of its local experts' pool rows.
+    rank_dedup_dispatch: bool = False
+    # Pre-sum a token's local fc2 rows and push one row per (token, rank)
+    # (dispatch-warp token-back, bf16 combine). Needs rank_dedup_dispatch.
+    rank_dedup_combine: bool = False
+    # Dispatch warps (standalone mode) and epilogue warps take token-back work
+    # once idle (dispatch-warp token-back, atomic_counter scheduling).
+    token_back_join_warps: bool = False
 
     def __post_init__(self) -> None:
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
@@ -247,6 +256,24 @@ class MegaMoENvfp4Config:
                 raise ValueError(
                     f"epi_flag_batch[{leg}] must be in [1, 32], got {val}."
                 )
+        if self.rank_dedup_combine and not (
+            self.rank_dedup_dispatch
+            and self.token_back_mode != "epi_warps"
+            and self.combine_dtype == "bf16"
+            and not self.use_custom_finalize
+        ):
+            raise ValueError(
+                "rank_dedup_combine requires rank_dedup_dispatch, a dispatch-warp "
+                "token_back_mode, combine_dtype='bf16' and use_custom_finalize=False."
+            )
+        if self.token_back_join_warps and (
+            self.token_back_mode == "epi_warps"
+            or self.load_balance_mode != "atomic_counter"
+        ):
+            raise ValueError(
+                "token_back_join_warps requires a dispatch-warp token_back_mode and "
+                "load_balance_mode='atomic_counter'."
+            )
 
     @property
     def num_experts_per_rank(self) -> int:
@@ -595,6 +622,9 @@ class MegaMoENvfp4Frontend:
             c.swiglu_beta,
             c.enable_iket,
             c.enable_fc1_activation_per_token_scale,
+            c.rank_dedup_dispatch,
+            c.rank_dedup_combine,
+            c.token_back_join_warps,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
@@ -664,6 +694,9 @@ class MegaMoENvfp4Frontend:
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
+            rank_dedup_dispatch=c.rank_dedup_dispatch,
+            rank_dedup_combine=c.rank_dedup_combine,
+            token_back_join_warps=c.token_back_join_warps,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
